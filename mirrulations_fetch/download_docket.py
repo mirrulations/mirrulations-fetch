@@ -15,6 +15,10 @@ DERIVED_DATA_PREFIX = 'derived-data'
 
 s3_client = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 
+def get_agency(docket):
+    return docket.split('-')[0].split('_')[0]
+
+
 def s3_key_exists(prefix):
     resp = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=1)
     return 'Contents' in resp and len(resp['Contents']) > 0
@@ -44,7 +48,7 @@ def relative_s3_path(s3_key, base_prefix):
 
 def print_stats(stats, totals, start_times):
     text_total = totals['text']
-    text_done = stats['docket'] + stats['documents'] + stats['comments'] + stats['derived']
+    text_done = stats['docket'] + stats['documents'] + stats['comments'] + stats.get('derived', 0)
     elapsed_text = time.time() - start_times['text']
     text_rate = text_done / elapsed_text if elapsed_text > 0 else 0
     text_remain = text_total - text_done
@@ -90,11 +94,11 @@ def download_worker(q, stats, totals, start_times, base_prefix, output_folder):
         q.task_done()
 
 @click.command()
-@click.argument('agency')
 @click.argument('docket_id')
 @click.option('--output-folder', default='.', help='Target output folder (default: current directory)')
 @click.option('--include-binary', is_flag=True, help='Include binary data in download')
-def main(agency, docket_id, output_folder, include_binary):
+def main(docket_id, output_folder, include_binary):
+    agency = get_agency(docket_id)
     # S3 prefixes
     raw_agency_docket_prefix = f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/'
     raw_text_prefix = f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/'
@@ -106,9 +110,6 @@ def main(agency, docket_id, output_folder, include_binary):
     if not s3_key_exists(raw_text_prefix):
         print(f"Text data for docket {docket_id} not found.", file=sys.stderr)
         sys.exit(1)
-    if not s3_key_exists(derived_prefix):
-        print(f"Derived data for docket {docket_id} not found.", file=sys.stderr)
-        sys.exit(1)
     print("Preparing download lists...")
     file_lists = {}
     total_sizes = {}
@@ -118,22 +119,28 @@ def main(agency, docket_id, output_folder, include_binary):
     print(f"Document total size: {total_sizes['documents']/1e6:.2f} MB")
     file_lists['comments'], total_sizes['comments'] = get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/comments/', 'comments')
     print(f"Comment total size:  {total_sizes['comments']/1e6:.2f} MB")
-    file_lists['derived'], total_sizes['derived'] = get_file_list(derived_prefix, 'derived')
-    print(f"Derived total size:  {total_sizes['derived']/1e6:.2f} MB")
+    if s3_key_exists(derived_prefix):
+        file_lists['derived'], total_sizes['derived'] = get_file_list(derived_prefix, 'derived')
+        print(f"Derived total size:  {total_sizes['derived']/1e6:.2f} MB")
+    else:
+        print("Derived data not found - skipping")
     if include_binary and s3_key_exists(raw_binary_prefix):
         file_lists['binary'], total_sizes['binary'] = get_file_list(raw_binary_prefix, 'binary')
         print(f"Binary total size:   {total_sizes['binary']/1e6:.2f} MB")
     # Stats
     totals = {
-        'text': len(file_lists['docket']) + len(file_lists['documents']) + len(file_lists['comments']) + len(file_lists['derived'])
+        'text': len(file_lists['docket']) + len(file_lists['documents']) + len(file_lists['comments'])
     }
+    if 'derived' in file_lists:
+        totals['text'] += len(file_lists['derived'])
     stats = {
         'docket': 0,
         'documents': 0,
         'comments': 0,
-        'derived': 0,
         'remaining': {k: len(v) for k, v in file_lists.items()}
     }
+    if 'derived' in file_lists:
+        stats['derived'] = 0
     start_times = {'text': time.time(), 'binary': None}
     if 'binary' in file_lists:
         totals['binary'] = len(file_lists['binary'])
