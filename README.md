@@ -10,8 +10,14 @@ This is a command line tool that allows data scientists and researchers to effic
 ## Requirements
 - Python 3.9+
 
-Install dependencies with:
+
+## Install
+
+The `setup.py` works with `pip` to create a command `mirrulations-fetch`.  It is recommended that you create a virtual environment and install locally:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install .
 ```
 
