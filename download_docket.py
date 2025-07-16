@@ -15,18 +15,9 @@ DERIVED_DATA_PREFIX = 'derived-data'
 
 s3_client = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 
-def s3_list_objects(prefix):
-    paginator = s3_client.get_paginator('list_objects_v2')
-    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
-        for obj in page.get('Contents', []):
-            yield obj['Key']
-
 def s3_key_exists(prefix):
     resp = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=1)
     return 'Contents' in resp and len(resp['Contents']) > 0
-
-def count_files(prefix):
-    return sum(1 for _ in s3_list_objects(prefix))
 
 def download_file(s3_key, local_path):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -34,17 +25,19 @@ def download_file(s3_key, local_path):
 
 def get_file_list(prefix, file_type=None):
     count = 0
+    total_size = 0
     files = []
     paginator = s3_client.get_paginator('list_objects_v2')
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
         for obj in page.get('Contents', []):
-            files.append(obj['Key'])
+            files.append({'Key': obj['Key'], 'Size': obj['Size']})
         count = len(files)
+        total_size = sum(f['Size'] for f in files)
         if file_type:
             print(f"{file_type}: {count}", end='\r', flush=True)
     if file_type:
         print(f"{file_type}: {count}")
-    return files
+    return files, total_size
 
 def relative_s3_path(s3_key, base_prefix):
     return os.path.relpath(s3_key, base_prefix)
@@ -76,7 +69,7 @@ def download_worker(q, stats, totals, start_times, base_prefix, output_folder):
         item = q.get()
         if item is None:
             break
-        s3_key, file_type = item
+        s3_key, file_type, size = item
         rel_path = relative_s3_path(s3_key, base_prefix[file_type])
         # Place raw-data files under raw-data/, derived-data files under derived-data/
         if file_type in ('docket', 'documents', 'comments', 'binary'):
@@ -117,15 +110,19 @@ def main(agency, docket_id, output_folder, include_binary):
         print(f"Derived data for docket {docket_id} not found.", file=sys.stderr)
         sys.exit(1)
     print("Preparing download lists...")
-    # Prepare download lists
-    file_lists = {
-        'docket': get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/docket/', 'docket'),
-        'documents': get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/documents/', 'documents'),
-        'comments': get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/comments/', 'comments'),
-        'derived': get_file_list(derived_prefix, 'derived'),
-    }
+    file_lists = {}
+    total_sizes = {}
+    file_lists['docket'], total_sizes['docket'] = get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/docket/', 'docket')
+    print(f"Docket total size:   {total_sizes['docket']/1e6:.2f} MB")
+    file_lists['documents'], total_sizes['documents'] = get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/documents/', 'documents')
+    print(f"Document total size: {total_sizes['documents']/1e6:.2f} MB")
+    file_lists['comments'], total_sizes['comments'] = get_file_list(f'{RAW_DATA_PREFIX}/{agency}/{docket_id}/text-{docket_id}/comments/', 'comments')
+    print(f"Comment total size:  {total_sizes['comments']/1e6:.2f} MB")
+    file_lists['derived'], total_sizes['derived'] = get_file_list(derived_prefix, 'derived')
+    print(f"Derived total size:  {total_sizes['derived']/1e6:.2f} MB")
     if include_binary and s3_key_exists(raw_binary_prefix):
-        file_lists['binary'] = get_file_list(raw_binary_prefix, 'binary')
+        file_lists['binary'], total_sizes['binary'] = get_file_list(raw_binary_prefix, 'binary')
+        print(f"Binary total size:   {total_sizes['binary']/1e6:.2f} MB")
     # Stats
     totals = {
         'text': len(file_lists['docket']) + len(file_lists['documents']) + len(file_lists['comments']) + len(file_lists['derived'])
@@ -151,8 +148,8 @@ def main(agency, docket_id, output_folder, include_binary):
     # Download queue
     q = queue.Queue()
     for file_type, files in file_lists.items():
-        for s3_key in files:
-            q.put((s3_key, file_type))
+        for f in files:
+            q.put((f['Key'], file_type, f['Size']))
     num_threads = min(8, q.qsize())
     threads = []
     for _ in range(num_threads):
